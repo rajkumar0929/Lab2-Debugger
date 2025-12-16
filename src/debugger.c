@@ -15,6 +15,8 @@
 
 static unsigned long breakpoint_addr = 0;  //where the breakpoint is
 static unsigned char saved_byte = 0;       //what original byte we overwrote
+static int breakpoint_active = 0;
+static int child_running = 1;
 
 
 static void print_wait_status(int status) {
@@ -26,11 +28,13 @@ static void print_wait_status(int status) {
     else if (WIFEXITED(status)) {
         printf("Child exited normally. Exit code: %d\n",
                WEXITSTATUS(status));
+        child_running = 0;
     }
     else if (WIFSIGNALED(status)) {
         int sig = WTERMSIG(status);
         printf("Child terminated by signal: %d (%s)\n",
                sig, strsignal(sig));
+        child_running = 0;
     }
     else {
         printf("Unknown child status\n");
@@ -73,6 +77,7 @@ static void insert_breakpoint(pid_t pid, unsigned long addr) {
 
     breakpoint_addr = addr;
     printf("Breakpoint inserted at 0x%lx\n", addr);
+    breakpoint_active = 1;
 }
 
 static int is_breakpoint_hit(pid_t pid) {
@@ -119,6 +124,73 @@ static void reinsert_breakpoint(pid_t pid) {
     long data_with_int3 = (data & ~0xff) | 0xcc;
     ptrace(PTRACE_POKETEXT, pid, (void *)breakpoint_addr, (void *)data_with_int3);
 }
+
+static void cleanup_and_detach(pid_t pid) {
+
+    /* Restore breakpoint ONLY if child is still running */
+    if (child_running && breakpoint_active) {
+        restore_breakpoint(pid);
+        breakpoint_active = 0;
+        printf("Breakpoint restored before detach.\n");
+    }
+
+    /* Detach ONLY if child is still running */
+    if (child_running) {
+        if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
+            perror("ptrace(DETACH)");
+        } else {
+            printf("Detached cleanly from child.\n");
+        }
+    }
+}
+
+
+static void command_loop(pid_t pid) {
+    char cmd[64];
+
+    while (1) {
+        printf("dbg> ");
+        fflush(stdout);
+
+        if (!fgets(cmd, sizeof(cmd), stdin))
+            break;
+
+        if (strncmp(cmd, "continue", 8) == 0 || strncmp(cmd, "c", 1) == 0) {
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+            int status;
+            waitpid(pid, &status, 0);
+            print_wait_status(status);
+
+            if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+                if (is_breakpoint_hit(pid)) {
+                    restore_breakpoint(pid);
+                    rewind_rip(pid);
+                    single_step(pid);
+                    reinsert_breakpoint(pid);
+                    printf("Breakpoint hit again.\n");
+                }
+            }
+        }
+        else if (strncmp(cmd, "step", 4) == 0 || strncmp(cmd, "s", 1) == 0) {
+            ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
+            int status;
+            waitpid(pid, &status, 0);
+            print_wait_status(status);
+        }
+        else if (strncmp(cmd, "regs", 4) == 0) {
+            print_registers(pid);
+        }
+        else if (strncmp(cmd, "quit", 4) == 0) {
+            cleanup_and_detach(pid);
+            printf("Exiting debugger.\n");
+            break;
+        }
+        else {
+            printf("Unknown command\n");
+        }
+    }
+}
+
 
 
 void debugger_start(char *program) {
@@ -173,6 +245,7 @@ void debugger_start(char *program) {
                 reinsert_breakpoint(child_pid);
 
                 printf("Breakpoint handled correctly, execution paused.\n");
+                command_loop(child_pid);
                 return;
             }
         }
