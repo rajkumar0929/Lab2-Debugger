@@ -11,13 +11,27 @@
 #include <sys/user.h>
 
 
-//0000000000001149
 
-static unsigned long breakpoint_addr = 0;  //where the breakpoint is
-static unsigned char saved_byte = 0;       //what original byte we overwrote
-static int breakpoint_active = 0;
+#define MAX_BREAKPOINTS 32
+
+typedef struct {
+    unsigned long addr;
+    unsigned char saved_byte;
+    int enabled;
+} breakpoint_t;
+
+static breakpoint_t breakpoints[MAX_BREAKPOINTS];
+static int breakpoint_count = 0;
 static int child_running = 1;
 
+static breakpoint_t *find_breakpoint(unsigned long addr) {
+    for (int i = 0; i < breakpoint_count; i++) {
+        if (breakpoints[i].addr == addr && breakpoints[i].enabled) {
+            return &breakpoints[i];
+        }
+    }
+    return NULL;
+}
 
 static void print_wait_status(int status) {
     if (WIFSTOPPED(status)) {
@@ -61,49 +75,39 @@ static void print_registers(pid_t pid) {
 }
 
 static void insert_breakpoint(pid_t pid, unsigned long addr) {
+    if (breakpoint_count >= MAX_BREAKPOINTS) {
+        printf("Maximum breakpoints reached\n");
+        return;
+    }
+
+    if (find_breakpoint(addr)) {
+        printf("Breakpoint already exists at 0x%lx\n", addr);
+        return;
+    }
+
     long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)addr, NULL);
     if (data == -1) {
         perror("ptrace(PEEKTEXT)");
-        exit(1);
+        return;
     }
 
-    saved_byte = (unsigned char)(data & 0xff);
+    breakpoint_t *bp = &breakpoints[breakpoint_count++];
+    bp->addr = addr;
+    bp->saved_byte = (unsigned char)(data & 0xff);
+    bp->enabled = 1;
+
     long data_with_int3 = (data & ~0xff) | 0xcc;
+    ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)data_with_int3);
 
-    if (ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)data_with_int3) == -1) {
-        perror("ptrace(POKETEXT)");
-        exit(1);
-    }
-
-    breakpoint_addr = addr;
-    printf("Breakpoint inserted at 0x%lx\n", addr);
-    breakpoint_active = 1;
+    printf("Breakpoint %d set at 0x%lx\n", breakpoint_count - 1, addr);
 }
 
-static int is_breakpoint_hit(pid_t pid) {
+static breakpoint_t *get_hit_breakpoint(pid_t pid) {
     struct user_regs_struct regs;
     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
 
-    if (regs.rip - 1 == breakpoint_addr) {
-        printf("Breakpoint hit at 0x%lx\n", breakpoint_addr);
-        return 1;
-    }
-    return 0;
-}
-
-static void restore_breakpoint(pid_t pid) {
-    long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)breakpoint_addr, NULL);
-    if (data == -1) {
-        perror("ptrace(PEEKTEXT)");
-        exit(1);
-    }
-
-    long restored = (data & ~0xff) | saved_byte;
-
-    if (ptrace(PTRACE_POKETEXT, pid, (void *)breakpoint_addr, (void *)restored) == -1) {
-        perror("ptrace(POKETEXT)");
-        exit(1);
-    }
+    unsigned long hit_addr = regs.rip - 1;
+    return find_breakpoint(hit_addr);
 }
 
 static void rewind_rip(pid_t pid) {
@@ -119,23 +123,28 @@ static void single_step(pid_t pid) {
     waitpid(pid, NULL, 0);
 }
 
-static void reinsert_breakpoint(pid_t pid) {
-    long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)breakpoint_addr, NULL);
+static void restore_breakpoint(pid_t pid, breakpoint_t *bp) {
+    long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)bp->addr, NULL);
+    long restored = (data & ~0xff) | bp->saved_byte;
+    ptrace(PTRACE_POKETEXT, pid, (void *)bp->addr, (void *)restored);
+}
+
+static void reinsert_breakpoint(pid_t pid, breakpoint_t *bp) {
+    long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)bp->addr, NULL);
     long data_with_int3 = (data & ~0xff) | 0xcc;
-    ptrace(PTRACE_POKETEXT, pid, (void *)breakpoint_addr, (void *)data_with_int3);
+    ptrace(PTRACE_POKETEXT, pid, (void *)bp->addr, (void *)data_with_int3);
 }
 
 static void cleanup_and_detach(pid_t pid) {
 
-    /* Restore breakpoint ONLY if child is still running */
-    if (child_running && breakpoint_active) {
-        restore_breakpoint(pid);
-        breakpoint_active = 0;
-        printf("Breakpoint restored before detach.\n");
-    }
-
-    /* Detach ONLY if child is still running */
     if (child_running) {
+        /* Restore ALL breakpoints */
+        for (int i = 0; i < breakpoint_count; i++) {
+            if (breakpoints[i].enabled) {
+                restore_breakpoint(pid, &breakpoints[i]);
+            }
+        }
+
         if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
             perror("ptrace(DETACH)");
         } else {
@@ -161,13 +170,22 @@ static void command_loop(pid_t pid) {
             waitpid(pid, &status, 0);
             print_wait_status(status);
 
+            /* Ignore SIGWINCH (window resize signal) */
+            if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGWINCH) {
+                /* Resume execution automatically */
+                ptrace(PTRACE_CONT, pid, NULL, NULL);
+                continue;
+            }
+
             if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-                if (is_breakpoint_hit(pid)) {
-                    restore_breakpoint(pid);
+                breakpoint_t *bp = get_hit_breakpoint(pid);
+                if (bp) {
+                    printf("Breakpoint hit at 0x%lx\n", bp->addr);
+
+                    restore_breakpoint(pid, bp);
                     rewind_rip(pid);
                     single_step(pid);
-                    reinsert_breakpoint(pid);
-                    printf("Breakpoint hit again.\n");
+                    reinsert_breakpoint(pid, bp);
                 }
             }
         }
@@ -184,6 +202,14 @@ static void command_loop(pid_t pid) {
             cleanup_and_detach(pid);
             printf("Exiting debugger.\n");
             break;
+        }
+        else if (strncmp(cmd, "break", 5) == 0) {
+            unsigned long addr;
+            if (sscanf(cmd + 5, "%lx", &addr) == 1) {
+                insert_breakpoint(pid, addr);
+            } else {
+                printf("Usage: break <hex-address>\n");
+            }
         }
         else {
             printf("Unknown command\n");
@@ -217,9 +243,6 @@ void debugger_start(char *program) {
         /* Print registers at stop */
         print_registers(child_pid);
 
-        unsigned long main_addr = 0x401136; 
-        insert_breakpoint(child_pid, main_addr);
-
 
         /* Continue execution */
         if (ptrace(PTRACE_CONT, child_pid, NULL, NULL) == -1) {
@@ -230,23 +253,17 @@ void debugger_start(char *program) {
         /* Wait for program to exit */
         waitpid(child_pid, &status, 0);
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-            if (is_breakpoint_hit(child_pid)) {
+            breakpoint_t *bp = get_hit_breakpoint(child_pid);
+            if (bp) {
+                printf("Breakpoint hit at 0x%lx\n", bp->addr);
 
-                /* 1. Restore original instruction */
-                restore_breakpoint(child_pid);
-
-                /* 2. Fix RIP */
+                restore_breakpoint(child_pid, bp);
                 rewind_rip(child_pid);
-
-                /* 3. Execute the real instruction */
                 single_step(child_pid);
+                reinsert_breakpoint(child_pid, bp);
 
-                /* 4. Reinsert breakpoint */
-                reinsert_breakpoint(child_pid);
-
-                printf("Breakpoint handled correctly, execution paused.\n");
+                /* ENTER interactive loop instead of exiting */
                 command_loop(child_pid);
-                return;
             }
         }
     }
