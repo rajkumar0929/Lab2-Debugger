@@ -243,6 +243,11 @@ void debugger_start(char *program) {
         /* Print registers at stop */
         print_registers(child_pid);
 
+        /* Enter interactive mode immediately (GDB-like behavior) */
+        // remove below line from comments
+        // command_loop(child_pid); 
+
+        // comment below block
 
         /* Continue execution */
         if (ptrace(PTRACE_CONT, child_pid, NULL, NULL) == -1) {
@@ -266,6 +271,8 @@ void debugger_start(char *program) {
                 command_loop(child_pid);
             }
         }
+    //block ends here
+
     }
 
     else {
